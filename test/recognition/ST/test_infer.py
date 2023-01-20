@@ -11,9 +11,9 @@ from mindface.recognition.runner import Network, lr_generator
 from mindface.recognition.utils import read_yaml
 from mindcv import create_optimizer
 
-import mindspore
+import mindspore as ms
 from mindspore import context
-
+import numpy as np
 from mindspore import FixedLossScaleManager, DynamicLossScaleManager
 from mindspore.train.model import Model, ParallelMode
 from mindspore.train.callback import ModelCheckpoint, CheckpointConfig, LossMonitor, TimeMonitor
@@ -29,7 +29,10 @@ def main():
     device_target = 'Ascend'
     running_mode = 'GRAPH'
     seed = 2022
-    mindspore.common.set_seed(seed)
+    model_name = iresnet50
+    num_features = 512
+    num_classes = 10572
+    ms.common.set_seed(seed)
 
     train_info = read_yaml(os.path.join(os.getcwd(), config))
 
@@ -69,102 +72,31 @@ def main():
                                               search_mode="recursive_programming")
     else:
         device_id = int(os.getenv('DEVICE_ID')) if os.getenv('DEVICE_ID') is not None else 0
-
-    train_dataset = create_dataset(
-        dataset_path=os.path.join(train_info['data_dir'], train_info['top_dir_name']),
-        do_train=True,
-        repeat_num=1,
-        batch_size=batch_size,
-        target=device_target,
-        is_parallel=(device_num > 1)
-            )
-
-    step = train_dataset.get_dataset_size()
-    assert step > 0, "Loading dataset error"
-
-    lr = lr_generator(train_info['learning_rate'], train_info['schedule'],
-                     train_info['gamma'], train_info['epochs'], steps_per_epoch=step)
-
-    if train_info['backbone'] == 'mobilefacenet':
-        net = get_mbf(num_features=train_info['num_features'])
-    elif train_info['backbone'] == 'iresnet50':
-        net = iresnet50(num_features=train_info['num_features'])
-    elif train_info['backbone'] == 'iresnet100':
-        net = iresnet100(num_features=train_info['num_features'])
-    elif train_info['backbone'] == 'vit_t':
-        net = vit_t(num_features=train_info['num_features'])
-    elif train_info['backbone'] == 'vit_s':
-        net = vit_s(num_features=train_info['num_features'])
-    elif train_info['backbone'] == 'vit_b':
-        net = vit_b(num_features=train_info['num_features'])
-    elif train_info['backbone'] == 'vit_l':
-        net = vit_l(num_features=train_info['num_features'])
+    if model_name == 'iresnet50':
+        model = iresnet50(num_features=num_features)
+        print("Finish loading iresnet50")
+    elif model_name == 'iresnet100':
+        model = iresnet100(num_features=num_features)
+        print("Finish loading iresnet100")
+    elif model_name == 'mobilefacenet':
+        model = get_mbf(num_features=num_features)
+        print("Finish loading mobilefacenet")
+    elif model_name == 'vit_t':
+        model = vit_t(num_features=num_features)
+        print("Finish loading vit_t")
+    elif model_name == 'vit_s':
+        model = vit_s(num_features=num_features)
+        print("Finish loading vit_s")
+    elif model_name == 'vit_b':
+        model = vit_b(num_features=num_features)
+        print("Finish loading vit_b")
+    elif model_name == 'vit_l':
+        model = vit_l(num_features=num_features)
+        print("Finish loading vit_l")
     else:
         raise NotImplementedError
+    bs = 256
+    x = ms.Tensor(np.ones([bs, 3, 112, 112]), ms.float32)
+    output = model(x)
+    assert output.shape[0] == bs, 'output shape not match'
 
-    if train_info["resume"]:
-        param_dict = load_checkpoint(train_info["resume"])
-        load_param_into_net(net, param_dict)
-
-    head = PartialFC(num_classes=train_info["num_classes"], world_size=device_num)
-
-    train_net = Network(net, head)
-
-    loss_func = ArcFace(world_size=device_num)
-
-    loss_scale_manager = None
-    loss_scale_for_opt = 1.0
-
-    if train_info["amp_level"] != "O3": # user for O0 or O2
-        if train_info["loss_scale"]>1.0: # adopt loss scale
-            if train_info["loss_scale_type"] == "fixed":
-                loss_scale_manager = FixedLossScaleManager(
-                    loss_scale=train_info["loss_scale"],
-                    drop_overflow_update=False
-                    )
-                # drop_overflow_update=False, loss_scale for opt changes
-                loss_scale_for_opt = train_info["loss_scale"]
-            else:
-                loss_scale_manager = DynamicLossScaleManager(
-                    init_loss_scale=train_info["loss_scale"],
-                    scale_factor=train_info["scale_factor"],
-                    scale_window=train_info["scale_window"]
-                    )
-        print(train_info["amp_level"], train_info["loss_scale"], train_info["loss_scale_type"])
-
-    optimizer = create_optimizer(train_net.trainable_params(),
-                            opt=train_info['optimizer'],
-                            lr=lr,
-                            weight_decay=train_info['weight_decay'],
-                            nesterov=train_info["use_nesterov"],
-                            filter_bias_and_bn=train_info["filter_bias_and_bn"],
-                            loss_scale = loss_scale_for_opt,
-                            )
-
-    if loss_scale_manager is not None:
-        model = Model(train_net, loss_fn=loss_func, optimizer=optimizer,
-                      amp_level=train_info["amp_level"], loss_scale_manager=loss_scale_manager)
-    else:
-        model = Model(train_net, loss_fn=loss_func, optimizer=optimizer,
-                      amp_level=train_info["amp_level"])
-
-    config_ck = CheckpointConfig(save_checkpoint_steps=train_info["save_checkpoint_steps"],
-                                keep_checkpoint_max=train_info["keep_checkpoint_max"])
-
-    ckpt_cb = ModelCheckpoint(prefix="_".join([train_info["method"], train_info['backbone']]),
-                                config=config_ck, directory=train_info['train_dir'])
-    time_cb = TimeMonitor(data_size=train_dataset.get_dataset_size())
-    loss_cb = LossMonitor()
-    cb = [ckpt_cb, time_cb, loss_cb]
-
-    if device_num == 1:
-        model.train(train_info['epochs'], train_dataset,
-                    callbacks=cb, dataset_sink_mode=DATASET_SINK_MODE)
-    elif device_num > 1 and get_rank() % 8 == 0:
-        model.train(train_info['epochs'], train_dataset,
-                    callbacks=cb, dataset_sink_mode=DATASET_SINK_MODE)
-    else:
-        model.train(train_info['epochs'], train_dataset, dataset_sink_mode=DATASET_SINK_MODE)
-
-if __name__=='__main__':
-    main()
